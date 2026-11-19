@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "reason": "Dependencies whose published crates omit their license text, with pinned replacement notices. qpic needs none so far.",
+  "files": [],
+  "packages": []
+}
