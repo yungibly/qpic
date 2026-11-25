@@ -47,7 +47,7 @@ qpic reads PNG, JPEG, GIF (the first frame), WebP, BMP, TIFF, ICO, QOI, TGA, and
 
 ## How it draws
 
-With Kitty graphics, qpic sends each image once and then only tells the terminal which part to show and how big, so panning and zooming cost a few bytes a frame even over ssh. When the terminal can read files on qpic's machine, images go through a temporary file; otherwise they travel inline, compressed, with a quick preview first. Keys that quit or switch images interrupt a long upload.
+With Kitty graphics, qpic sends each image once and then only tells the terminal which part to show and how big, so panning and zooming cost a few bytes a frame even over ssh. When the terminal can read files on qpic's machine, images go through a temporary file; otherwise they travel inline, compressed, with a quick preview first. Rex gets them inline too: its app can be on another machine, and only inline images reach it compressed. Keys that quit or switch images interrupt a long upload.
 
 Images you have viewed stay in the terminal, so going back is instant. Terminals cap the memory their images use: Ghostty and Kitty allow 320 MB, and Rex 128 MiB, which holds about two 12-megapixel photos. qpic stays within the cap, forgetting the least recently viewed images first, and adjusts if a terminal turns out to allow less. Very large images are scaled down to fit.
 
@@ -63,7 +63,7 @@ cargo test --locked
 QPIC_LOG=/tmp/qpic.log target/release/qpic image.png   # log terminal replies and placements
 ```
 
-`QPIC_TRANSPORT=direct` sends images inline even when a temporary file would work, which is how they travel over ssh.
+`QPIC_TRANSPORT=direct` sends images inline even when a temporary file would work, which is how they travel over ssh. `QPIC_TRANSPORT=file` uses temporary files even where qpic would send inline, such as in Rex.
 
 - [Release guide](docs/releases.md): CI, archives, and the Homebrew tap.
 
