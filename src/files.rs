@@ -3,12 +3,13 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::ffi::OsStr;
-use std::io;
+use std::fs::File;
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use image::metadata::Orientation;
-use image::{DynamicImage, ImageDecoder, ImageReader};
+use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
 
 const EXTENSIONS: &[&str] = &[
     "bmp", "gif", "ico", "jfif", "jpe", "jpeg", "jpg", "pam", "pbm", "pgm", "png", "pnm", "ppm",
@@ -129,12 +130,38 @@ pub fn natural_cmp(a: &str, b: &str) -> Ordering {
     }
 }
 
+/// A file that stops being readable once nobody wants what is in it.
+struct Watched<'a> {
+    file: File,
+    wanted: &'a dyn Fn() -> bool,
+}
+
+impl Read for Watched<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if !(self.wanted)() {
+            return Err(io::Error::other("no longer wanted"));
+        }
+        self.file.read(buf)
+    }
+}
+
+impl Seek for Watched<'_> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.file.seek(pos)
+    }
+}
+
 /// Decodes an image, turned upright according to its EXIF orientation.
-pub fn load(path: &Path) -> Result<DynamicImage, String> {
-    let mut reader = ImageReader::open(path)
-        .map_err(|e| e.to_string())?
-        .with_guessed_format()
-        .map_err(|e| e.to_string())?;
+/// `wanted` is asked each time more of the file is read. Once it says no,
+/// decoding fails, so an image nobody is waiting for doesn't hold up the next.
+pub fn load(path: &Path, wanted: &dyn Fn() -> bool) -> Result<DynamicImage, String> {
+    let file = File::open(path).map_err(|e| e.to_string())?;
+    let mut reader = ImageReader::new(BufReader::new(Watched { file, wanted }));
+    // The name says what the file is when its contents can't, as with TGA.
+    if let Ok(format) = ImageFormat::from_path(path) {
+        reader.set_format(format);
+    }
+    let mut reader = reader.with_guessed_format().map_err(|e| e.to_string())?;
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(1 << 30);
     reader.limits(limits);
@@ -177,11 +204,12 @@ mod tests {
         let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(6, 4, |x, y| {
             image::Rgb([x as u8 * 40, y as u8 * 60, 128])
         }));
-        for ext in ["png", "jpg", "gif", "webp", "bmp", "tiff", "qoi"] {
+        for ext in ["png", "jpg", "gif", "webp", "bmp", "tiff", "qoi", "tga"] {
             let path = dir.join(format!("sample.{ext}"));
             img.save(&path).unwrap();
-            let loaded = load(&path).unwrap_or_else(|e| panic!("{ext}: {e}"));
+            let loaded = load(&path, &|| true).unwrap_or_else(|e| panic!("{ext}: {e}"));
             assert_eq!((loaded.width(), loaded.height()), (6, 4), "{ext}");
+            assert!(load(&path, &|| false).is_err(), "{ext}");
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
