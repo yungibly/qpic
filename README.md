@@ -70,6 +70,8 @@ QPIC_LOG=/tmp/qpic.log target/release/qpic image.png   # log terminal replies an
 
 `QPIC_TRANSPORT=direct` sends images inline even when a temporary file would work, which is how they travel over ssh. `QPIC_TRANSPORT=file` uses temporary files even where qpic would send inline, such as in Rex.
 
+The tests in `tests/viewer.rs` run the built viewer on a pseudo-terminal, press keys, and check what it draws and uploads.
+
 - [Release guide](docs/releases.md): CI, archives, and the Homebrew tap.
 
 qpic's code is [MIT licensed](LICENSE); Rust dependencies keep their own notices in release archives.
