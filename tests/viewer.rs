@@ -353,9 +353,20 @@ impl Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
+        // A test that failed leaves qpic running. Asked to stop, it removes
+        // its temporary files, which killing it outright would leave behind.
+        // It may be waiting for its output to be read, so that goes on.
+        self.resume();
+        if matches!(self.child.try_wait(), Ok(None)) {
+            // SAFETY: the process is our child, and it hasn't been waited for.
+            unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM) };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
-        self.resume();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
