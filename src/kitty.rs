@@ -79,34 +79,68 @@ pub fn transmit_file(out: &mut Vec<u8>, id: u32, format: u32, w: u32, h: u32, pa
     );
 }
 
-/// Compresses the pixels and splits them into the escape codes of a chunked
-/// upload. Text may go between the chunks, but no other graphics commands.
-pub fn direct_chunks(id: u32, format: u32, w: u32, h: u32, data: &[u8]) -> Vec<Vec<u8>> {
-    let mut z = ZlibEncoder::new(Vec::with_capacity(data.len() / 2), Compression::fast());
-    let _ = z.write_all(data);
-    let compressed = z.finish().unwrap_or_default();
-    let encoded = STANDARD.encode(&compressed);
-    let pieces: Vec<&[u8]> = encoded.as_bytes().chunks(4096).collect();
-    let last = pieces.len().saturating_sub(1);
-    pieces
-        .iter()
-        .enumerate()
-        .map(|(i, piece)| {
-            let more = (i < last) as u8;
-            let mut v = Vec::with_capacity(piece.len() + 64);
-            let _ = if i == 0 {
-                write!(
-                    v,
-                    "\x1b_Ga=t,i={id},f={format},s={w},v={h},o=z,t=d,q=1,m={more};"
-                )
-            } else {
-                write!(v, "\x1b_Gm={more},q=1;")
-            };
-            v.extend_from_slice(piece);
-            v.extend_from_slice(b"\x1b\\");
-            v
-        })
-        .collect()
+/// An image's pixels, ready to send.
+pub struct Payload {
+    /// 24 (RGB) or 32 (RGBA).
+    pub format: u32,
+    pub w: u32,
+    pub h: u32,
+    /// The pixels as they are, for a temporary file, or what `encode` made of
+    /// them, for a direct upload.
+    pub data: Vec<u8>,
+    pub encoded: bool,
+}
+
+impl Payload {
+    pub fn new(format: u32, w: u32, h: u32, pixels: Vec<u8>, transport: Transport) -> Payload {
+        let encoded = transport == Transport::Direct;
+        let data = if encoded { encode(&pixels) } else { pixels };
+        Payload {
+            format,
+            w,
+            h,
+            data,
+            encoded,
+        }
+    }
+
+    /// Turns raw pixels into a direct upload, for when a temporary file fails.
+    pub fn encode(&mut self) {
+        if !self.encoded {
+            self.data = encode(&self.data);
+            self.encoded = true;
+        }
+    }
+}
+
+/// Compresses pixels into the text a direct upload carries.
+fn encode(pixels: &[u8]) -> Vec<u8> {
+    let mut z = ZlibEncoder::new(Vec::with_capacity(pixels.len() / 2), Compression::fast());
+    let _ = z.write_all(pixels);
+    STANDARD.encode(z.finish().unwrap_or_default()).into_bytes()
+}
+
+/// How much of an encoded image one escape code of a direct upload carries.
+pub const CHUNK: usize = 4096;
+
+/// Writes the escape code that carries an encoded image's data from `offset`
+/// on, and returns where the next one starts: the data's length once it has
+/// all gone. Text may go between the codes, but no other graphics commands.
+pub fn direct_chunk(out: &mut Vec<u8>, id: u32, image: &Payload, offset: usize) -> usize {
+    let end = (offset + CHUNK).min(image.data.len());
+    let more = (end < image.data.len()) as u8;
+    let _ = if offset == 0 {
+        let Payload { format, w, h, .. } = image;
+        write!(
+            out,
+            "\x1b_Ga=t,i={id},f={format},s={w},v={h},o=z,t=d,q=1,m={more};"
+        )
+    } else {
+        write!(out, "\x1b_Gm={more},q=1;")
+    };
+    out.extend_from_slice(&image.data[offset..end]);
+    out.extend_from_slice(b"\x1b\\");
+    end
 }
 
 /// Shows `img` according to `pl`, whose source rectangle is in the pixels of
@@ -150,15 +184,49 @@ mod tests {
 
     #[test]
     fn chunks_mark_all_but_the_last_as_continued() {
-        let data: Vec<u8> = (0..200_000u32)
+        let pixels: Vec<u8> = (0..200_000u32)
             .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
             .collect();
-        let chunks = direct_chunks(5, 24, 400, 166, &data);
+        let image = Payload::new(24, 400, 166, pixels.clone(), Transport::Direct);
+        let (mut chunks, mut offset) = (Vec::new(), 0);
+        while offset < image.data.len() {
+            let mut chunk = Vec::new();
+            offset = direct_chunk(&mut chunk, 5, &image, offset);
+            chunks.push(chunk);
+        }
         assert!(chunks.len() > 2);
         assert!(chunks[0].starts_with(b"\x1b_Ga=t,i=5,f=24,s=400,v=166,o=z,t=d,q=1,m=1;"));
         assert!(chunks[1].starts_with(b"\x1b_Gm=1,q=1;"));
         assert!(chunks.last().unwrap().starts_with(b"\x1b_Gm=0,q=1;"));
         assert!(chunks.iter().all(|c| c.ends_with(b"\x1b\\")));
+
+        // The chunks carry the pixels, compressed and base64-encoded.
+        let text: Vec<u8> = chunks
+            .iter()
+            .flat_map(|c| {
+                let start = c.iter().position(|&b| b == b';').unwrap() + 1;
+                c[start..c.len() - 2].to_vec()
+            })
+            .collect();
+        let mut unpacked = Vec::new();
+        let compressed = STANDARD.decode(text).unwrap();
+        std::io::Read::read_to_end(
+            &mut flate2::read::ZlibDecoder::new(&compressed[..]),
+            &mut unpacked,
+        )
+        .unwrap();
+        assert_eq!(unpacked, pixels);
+    }
+
+    #[test]
+    fn a_temporary_file_payload_keeps_the_pixels_until_encoded() {
+        let mut image = Payload::new(24, 2, 1, vec![1, 2, 3, 4, 5, 6], Transport::TempFile);
+        assert_eq!((image.encoded, image.data.len()), (false, 6));
+        image.encode();
+        assert!(image.encoded);
+        let mut chunk = Vec::new();
+        assert_eq!(direct_chunk(&mut chunk, 9, &image, 0), image.data.len());
+        assert!(chunk.starts_with(b"\x1b_Ga=t,i=9,f=24,s=2,v=1,o=z,t=d,q=1,m=0;"));
     }
 
     #[test]

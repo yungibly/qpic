@@ -25,7 +25,40 @@ pub struct Tty {
     file: File,
     orig: libc::termios,
     signals: UnixStream,
+    /// Becomes readable when a `Waker` is used.
+    wakes: UnixStream,
+    waker: Waker,
     quit: Arc<AtomicBool>,
+}
+
+/// What a wait found: input from the terminal, or a signal. A wait that a
+/// `Waker` or the timeout ended finds neither.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Ready {
+    pub input: bool,
+    pub signal: bool,
+}
+
+/// Ends the main loop's wait from another thread.
+pub struct Waker(UnixStream);
+
+impl Waker {
+    /// A waker and the socket that becomes readable when it is used.
+    pub fn pair() -> io::Result<(UnixStream, Waker)> {
+        let (wakes, waker) = UnixStream::pair()?;
+        wakes.set_nonblocking(true)?;
+        waker.set_nonblocking(true)?;
+        Ok((wakes, Waker(waker)))
+    }
+
+    pub fn wake(&self) {
+        // A full socket means a wake is already waiting to be noticed.
+        let _ = (&self.0).write(&[0]);
+    }
+
+    pub fn try_clone(&self) -> io::Result<Waker> {
+        Ok(Waker(self.0.try_clone()?))
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -64,12 +97,19 @@ impl Tty {
         for sig in [SIGTERM, SIGHUP, SIGINT] {
             signal_hook::flag::register(sig, quit.clone())?;
         }
+        let (wakes, waker) = Waker::pair()?;
         Ok(Tty {
             file,
             orig,
             signals: rx,
+            wakes,
+            waker,
             quit,
         })
+    }
+
+    pub fn waker(&self) -> io::Result<Waker> {
+        self.waker.try_clone()
     }
 
     pub fn size(&self) -> Size {
@@ -84,20 +124,21 @@ impl Tty {
         }
     }
 
-    /// Waits for input or a signal. Returns whether input is ready and whether
-    /// a signal arrived. `None` waits forever.
+    /// Waits for input, a signal, or a `Waker`. `None` waits forever.
     ///
     /// This uses select() rather than poll(): macOS's poll() doesn't support
     /// devices and reports /dev/tty as invalid, while select() works everywhere.
-    pub fn wait(&self, timeout: Option<Duration>) -> io::Result<(bool, bool)> {
+    pub fn wait(&self, timeout: Option<Duration>) -> io::Result<Ready> {
         let (tty, signals) = (self.file.as_raw_fd(), self.signals.as_raw_fd());
-        // SAFETY: fd_set is plain data, both descriptors are open and far below
+        let wakes = self.wakes.as_raw_fd();
+        // SAFETY: fd_set is plain data, the descriptors are open and far below
         // FD_SETSIZE, and select() only touches the sets and timeval given.
-        unsafe {
+        let (input, signal, woken) = unsafe {
             let mut read: libc::fd_set = std::mem::zeroed();
             libc::FD_ZERO(&mut read);
             libc::FD_SET(tty, &mut read);
             libc::FD_SET(signals, &mut read);
+            libc::FD_SET(wakes, &mut read);
             let mut tv = timeout.map(|d| libc::timeval {
                 tv_sec: d.as_secs().min(i32::MAX as u64) as libc::time_t,
                 tv_usec: d.subsec_micros() as libc::suseconds_t,
@@ -106,7 +147,7 @@ impl Tty {
                 .as_mut()
                 .map_or(std::ptr::null_mut(), |t| t as *mut libc::timeval);
             let n = libc::select(
-                tty.max(signals) + 1,
+                tty.max(signals).max(wakes) + 1,
                 &mut read,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
@@ -115,13 +156,25 @@ impl Tty {
             if n < 0 {
                 let err = io::Error::last_os_error();
                 return if err.kind() == io::ErrorKind::Interrupted {
-                    Ok((false, true))
+                    Ok(Ready {
+                        signal: true,
+                        ..Ready::default()
+                    })
                 } else {
                     Err(err)
                 };
             }
-            Ok((libc::FD_ISSET(tty, &read), libc::FD_ISSET(signals, &read)))
+            (
+                libc::FD_ISSET(tty, &read),
+                libc::FD_ISSET(signals, &read),
+                libc::FD_ISSET(wakes, &read),
+            )
+        };
+        if woken {
+            let mut buf = [0u8; 64];
+            while matches!((&self.wakes).read(&mut buf), Ok(n) if n > 0) {}
         }
+        Ok(Ready { input, signal })
     }
 
     /// Drains pending signal notifications. Returns true if one asked qpic to quit.
@@ -152,10 +205,15 @@ impl Drop for Tty {
     }
 }
 
-/// Restores the terminal before a panic message prints, so the message is readable.
+/// Restores the terminal before a panic message prints, so the message is
+/// readable. A panic in the loader thread only costs the image it was
+/// decoding, which the viewer reports itself, so the terminal stays as it is.
 pub fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().name() == Some(crate::loader::THREAD) {
+            return;
+        }
         if let Some((fd, orig)) = SAVED.get() {
             unsafe {
                 libc::write(*fd, LEAVE.as_ptr().cast(), LEAVE.len());

@@ -3,6 +3,7 @@ mod blocks;
 mod files;
 mod input;
 mod kitty;
+mod loader;
 mod term;
 mod view;
 
