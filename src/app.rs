@@ -395,7 +395,16 @@ impl App {
                 self.log(format_args!("probe timed out"));
                 break;
             }
-            if !self.tty.wait(Some(left))?.input {
+            let ready = self.tty.wait(Some(left))?;
+            if ready.signal {
+                // Taking the signal stops it ending every wait from here on.
+                if self.tty.take_signals() {
+                    self.quit = true;
+                    break;
+                }
+                self.resized = true;
+            }
+            if !ready.input {
                 continue;
             }
             self.read_input()?;
@@ -672,6 +681,14 @@ impl App {
         Ok(())
     }
 
+    /// When an image's file last changed, if the file is still there. An
+    /// image in the terminal is only good while this stays the same.
+    fn modified(&self, index: usize) -> Option<SystemTime> {
+        std::fs::metadata(&self.files[index])
+            .and_then(|m| m.modified())
+            .ok()
+    }
+
     /// The image on screen, which isn't the selected one while that loads.
     fn shown(&self) -> Option<usize> {
         match &self.picture {
@@ -694,8 +711,15 @@ impl App {
         self.last_move = Some(now);
         self.message = None;
         self.dirty = true;
+        let modified = self.modified(self.index);
         match &self.picture {
-            Picture::Ready(entry) if entry.index == self.index && entry.complete() => {
+            // It never left the screen, and its file is as it was.
+            Picture::Ready(entry)
+                if entry.index == self.index
+                    && entry.complete()
+                    && modified.is_some()
+                    && entry.modified == modified =>
+            {
                 return Ok(());
             }
             // An error about another image has nothing to say any more.
@@ -725,9 +749,7 @@ impl App {
             return false;
         };
         let entry = self.cache.remove(pos);
-        let modified = std::fs::metadata(&self.files[index])
-            .and_then(|m| m.modified())
-            .ok();
+        let modified = self.modified(index);
         if modified.is_none() || entry.modified != modified {
             self.discard(entry);
             return false;
@@ -746,7 +768,7 @@ impl App {
         self.load_at = None;
         let index = self.index;
         let path = self.files[index].clone();
-        let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        let modified = self.modified(index);
         // A load that was cut short may have left its preview on screen.
         let previewed = matches!(
             &self.picture,

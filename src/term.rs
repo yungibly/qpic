@@ -79,12 +79,6 @@ impl Tty {
         if unsafe { libc::tcgetattr(fd, &mut orig) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        let mut raw = orig;
-        unsafe { libc::cfmakeraw(&mut raw) };
-        if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &raw) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let _ = SAVED.set((fd, orig));
 
         // Signals wake the main loop through a socket pair, so poll() sees them.
         let (rx, tx) = UnixStream::pair()?;
@@ -98,6 +92,15 @@ impl Tty {
             signal_hook::flag::register(sig, quit.clone())?;
         }
         let (wakes, waker) = Waker::pair()?;
+
+        // Raw mode comes last: everything above can fail, and only a `Tty`
+        // that exists puts the terminal back as it was.
+        let mut raw = orig;
+        unsafe { libc::cfmakeraw(&mut raw) };
+        if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &raw) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let _ = SAVED.set((fd, orig));
         Ok(Tty {
             file,
             orig,

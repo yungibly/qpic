@@ -210,10 +210,12 @@ fn prepare(
     send: &mut dyn FnMut(Reply),
 ) -> Result<(), String> {
     let serial = request.serial;
-    let img = files::load(&request.path)?;
-    if !wanted() {
-        return Ok(());
-    }
+    let img = match files::load(&request.path, wanted) {
+        Ok(img) if wanted() => img,
+        Err(error) if wanted() => return Err(error),
+        // Nobody is waiting to hear how it went.
+        _ => return Ok(()),
+    };
     let (w, h) = (img.width(), img.height());
     match request.form {
         Form::Blocks => {

@@ -686,3 +686,32 @@ fn a_picture_makes_way_early_when_the_terminal_is_short_of_room() {
     term.press(b"q");
     assert!(term.finish().0.success());
 }
+
+#[test]
+fn an_image_that_changed_while_on_screen_loads_again() {
+    let dir = folder("changed");
+    plain_images(&dir, 2);
+    let mut term = Terminal::start(dir.clone(), &["--mode", "kitty", "."], None);
+    term.wait_for_image("01.png");
+
+    // The file is written again, wider, and dated later so that even a
+    // coarse clock shows the change.
+    let path = dir.join("01.png");
+    let img = image::RgbImage::from_pixel(1250, 800, image::Rgb([200, 40, 40]));
+    img.save(&path).unwrap();
+    let later = std::time::SystemTime::now() + Duration::from_secs(5);
+    let file = File::options().write(true).open(&path).unwrap();
+    file.set_modified(later).unwrap();
+    drop(file);
+
+    // Away and straight back: the old picture never leaves the screen.
+    term.press(&[RIGHT, LEFT].concat());
+    term.wait_for("the image as it is now", |seen| {
+        let bar = status(seen);
+        bar.contains("01.png   1250×800") && !bar.contains("loading")
+    });
+    assert_eq!(uploads(&term.seen()), [(1201, 800), (1250, 800)]);
+
+    term.press(b"q");
+    assert!(term.finish().0.success());
+}
