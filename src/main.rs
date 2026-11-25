@@ -6,6 +6,7 @@ mod kitty;
 mod term;
 mod view;
 
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -15,8 +16,10 @@ const USAGE: &str = "\
 qpic: view images in the terminal, zooming and panning with the mouse
 
 Usage: qpic [options] <image|folder>...
+       <command> | qpic [options] -
 
 Opening one image lets you browse the other images in its folder.
+A - reads paths from standard input, one per line, and shows them in that order.
 
 Options:
   -m, --mode <mode>  How to draw: auto, kitty or blocks (default: auto)
@@ -49,10 +52,24 @@ fn main() -> ExitCode {
     let mut paths = Vec::new();
     let mut mode = DrawMode::Auto;
     let mut only_paths = false;
+    let mut listed = false;
     while let Some(arg) = args.next() {
         let text = arg.to_str().unwrap_or("");
-        if only_paths || !text.starts_with('-') || text == "-" {
+        if only_paths || !text.starts_with('-') {
             paths.push(PathBuf::from(arg));
+            continue;
+        }
+        if text == "-" {
+            // The viewer talks to /dev/tty, which leaves standard input free
+            // for a list. A path that is gone by now is skipped: whatever
+            // wrote the list may have raced a file being deleted.
+            let mut bytes = Vec::new();
+            if let Err(e) = std::io::stdin().lock().read_to_end(&mut bytes) {
+                eprintln!("qpic: can't read standard input: {e}");
+                return ExitCode::FAILURE;
+            }
+            paths.extend(files::split_list(&bytes).into_iter().filter(|p| p.exists()));
+            listed = true;
             continue;
         }
         let value = match text {
@@ -83,11 +100,11 @@ fn main() -> ExitCode {
             }
         }
     }
-    if paths.is_empty() {
+    if paths.is_empty() && !listed {
         eprint!("{USAGE}");
         return ExitCode::from(2);
     }
-    let (list, start) = match files::collect(&paths) {
+    let (list, start) = match files::collect(&paths, listed) {
         Ok(found) => found,
         Err(e) => {
             eprintln!("qpic: {e}");
