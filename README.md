@@ -21,7 +21,10 @@ Images are drawn at full resolution in terminals with the Kitty graphics protoco
 qpic photo.jpg            # the other images in its folder are a key away
 qpic ~/Pictures           # every image in a folder
 qpic a.png b.png c.png    # just these
+ls -t *.png | qpic -      # paths from another program, in its order
 ```
+
+`-` reads paths from standard input, one per line, so another program can choose what to show. `fd -e png --changed-within 1h . /tmp | qpic -` opens every PNG written under `/tmp` in the last hour. Paths separated by NUL bytes, as `find -print0` writes them, work too, and a path that no longer exists is skipped.
 
 qpic reads PNG, JPEG, GIF (the first frame), WebP, BMP, TIFF, ICO, QOI, TGA, and PNM, and turns photos upright according to their EXIF orientation.
 
