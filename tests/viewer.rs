@@ -40,8 +40,17 @@ struct Shared {
 }
 
 impl Shared {
+    /// A test that fails while it holds the lock mustn't take the reader
+    /// thread, or its own cleanup, down with it.
     fn seen(&self) -> MutexGuard<'_, Seen> {
-        self.seen.lock().unwrap()
+        self.seen.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn wait<'a>(&self, seen: MutexGuard<'a, Seen>, left: Duration) -> MutexGuard<'a, Seen> {
+        match self.changed.wait_timeout(seen, left) {
+            Ok((seen, _)) => seen,
+            Err(e) => e.into_inner().0,
+        }
     }
 }
 
@@ -102,6 +111,18 @@ fn last_upload_id(seen: &[u8]) -> String {
     let text = String::from_utf8_lossy(seen);
     let header = text.rsplit("\x1b_Ga=t,i=").next().unwrap();
     header.chars().take_while(char::is_ascii_digit).collect()
+}
+
+/// The id of the image qpic last placed on screen.
+fn shown_id(seen: &[u8]) -> String {
+    let text = String::from_utf8_lossy(seen);
+    let placement = text.rsplit("\x1b_Ga=p,i=").next().unwrap();
+    placement.chars().take_while(char::is_ascii_digit).collect()
+}
+
+/// Where qpic told the terminal to free an image's data, if it has.
+fn freed_at(seen: &[u8], id: &str) -> Option<usize> {
+    find(seen, format!("\x1b_Ga=d,d=I,i={id},").as_bytes())
 }
 
 /// The temporary file qpic named in its last upload.
@@ -219,7 +240,7 @@ impl Terminal {
                 {
                     let mut seen = theirs.seen();
                     while seen.paused {
-                        seen = theirs.changed.wait(seen).unwrap();
+                        seen = theirs.wait(seen, PATIENCE);
                     }
                 }
                 // Reading fails or returns nothing once qpic has exited.
@@ -262,14 +283,16 @@ impl Terminal {
         while !done(&seen.bytes) {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                let tail = seen.bytes.len().saturating_sub(600);
+                let bytes = seen.bytes.clone();
+                drop(seen);
+                let tail = bytes.len().saturating_sub(600);
                 panic!(
                     "never saw {what}. The status bar was {:?}, and the output ended with {:?}",
-                    status(&seen.bytes),
-                    String::from_utf8_lossy(&seen.bytes[tail..])
+                    status(&bytes),
+                    String::from_utf8_lossy(&bytes[tail..])
                 );
             }
-            seen = self.shared.changed.wait_timeout(seen, left).unwrap().0;
+            seen = self.shared.wait(seen, left);
         }
     }
 
@@ -295,8 +318,11 @@ impl Terminal {
         let mut seen = self.shared.seen();
         while !seen.paused {
             let left = deadline.saturating_duration_since(Instant::now());
-            assert!(!left.is_zero(), "the output never reached the pause point");
-            seen = self.shared.changed.wait_timeout(seen, left).unwrap().0;
+            if left.is_zero() {
+                drop(seen);
+                panic!("the output never reached the pause point");
+            }
+            seen = self.shared.wait(seen, left);
         }
     }
 
@@ -573,6 +599,89 @@ fn an_image_the_terminal_refuses_is_sent_again_and_then_reported() {
         status(seen).contains("terminal: ENOMEM:too big")
     });
     assert_eq!(uploads(&term.seen()).len(), 4);
+
+    term.press(b"q");
+    assert!(term.finish().0.success());
+}
+
+#[test]
+fn a_picture_the_terminal_lost_while_another_loads_is_not_sent_again() {
+    let dir = folder("lost");
+    plain_images(&dir, 1);
+    noise_image(&dir.join("02.bmp"));
+    let mut term = Terminal::start(dir, &["--mode", "kitty", "."], None);
+    term.wait_for_image("01.png");
+    let first = last_upload_id(&term.seen());
+
+    // The first picture is still up while the second one's preview arrives.
+    term.pause_at(b",s=512,v=394,");
+    term.press(RIGHT);
+    term.wait_until_paused();
+    term.press(format!("\x1b_Gi={first};ENOENT:gone\x1b\\").as_bytes());
+    term.resume();
+    term.wait_for_image("02.bmp");
+
+    let seen = term.seen();
+    assert_eq!(uploads(&seen), [(1201, 800), (512, 394), (1300, 1000)]);
+    assert!(freed_at(&seen, &first).is_some());
+
+    term.press(b"q");
+    assert!(term.finish().0.success());
+}
+
+#[test]
+fn a_picture_makes_way_early_when_the_terminal_is_short_of_room() {
+    let dir = folder("room");
+    for n in 1..=2 {
+        let img = image::RgbImage::from_pixel(1800 + n, 1300, image::Rgb([40, 90, 30 * n as u8]));
+        img.save(dir.join(format!("{n:02}.png"))).unwrap();
+    }
+    // Temporary files come without previews, so a picture stays on screen
+    // right up to the upload that replaces it.
+    let mut term = Terminal::start_with(dir, &["--mode", "kitty", "."], None, "file");
+    term.wait_for_image("01.png");
+
+    // Each refusal makes qpic assume the terminal has a quarter less room,
+    // and it sends an image again up to three times.
+    let refuse = |term: &mut Terminal, name: &str| {
+        let seen = term.seen();
+        let sent = uploads(&seen).len();
+        let id = shown_id(&seen);
+        term.press(format!("\x1b_Gi={id};ENOMEM:full\x1b\\").as_bytes());
+        term.wait_for("the image sent again", |seen| {
+            uploads(seen).len() == sent + 1
+        });
+        term.wait_for_image(name);
+    };
+    for _ in 0..3 {
+        refuse(&mut term, "01.png");
+    }
+    term.press(RIGHT);
+    term.wait_for_image("02.png");
+    for _ in 0..3 {
+        refuse(&mut term, "02.png");
+    }
+    // The terminal still has the first image. A seventh refusal there brings
+    // the room qpic assumes down to 16 MiB, less than the two images take
+    // together.
+    let sent = uploads(&term.seen()).len();
+    term.press(LEFT);
+    term.wait_for_image("01.png");
+    assert_eq!(uploads(&term.seen()).len(), sent);
+    refuse(&mut term, "01.png");
+    let before = term.seen().len();
+    let leaving = shown_id(&term.seen());
+
+    // Now the picture on screen has to be freed before the next one is sent,
+    // where it would otherwise stay up until that one could be shown.
+    term.press(RIGHT);
+    term.wait_for_image("02.png");
+    let seen = term.seen();
+    let arriving = last_upload_id(&seen);
+    let freed = freed_at(&seen[before..], &leaving).expect("the old picture should be freed");
+    let header = format!("\x1b_Ga=t,i={arriving},");
+    let upload = find(&seen[before..], header.as_bytes()).unwrap();
+    assert!(freed < upload, "freed at {freed}, upload began at {upload}");
 
     term.press(b"q");
     assert!(term.finish().0.success());
