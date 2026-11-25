@@ -260,7 +260,7 @@ impl App {
             let transport = match std::env::var("QPIC_TRANSPORT").as_deref() {
                 Ok("direct") => Transport::Direct,
                 Ok("file") => Transport::TempFile,
-                _ if caps.temp_dir.is_some() => Transport::TempFile,
+                _ if caps.temp_dir.is_some() && !relays_images() => Transport::TempFile,
                 _ => Transport::Direct,
             };
             self.temp_dir = caps
@@ -1091,15 +1091,28 @@ impl App {
 /// say who they are; anything else gets a size that fits Rex, and qpic shrinks
 /// it further if the terminal turns out to allow less.
 fn storage_budget() -> u64 {
-    let var = |name| std::env::var(name).unwrap_or_default();
-    let known = matches!(var("TERM_PROGRAM").as_str(), "ghostty" | "kitty")
-        || matches!(var("TERM").as_str(), "xterm-ghostty" | "xterm-kitty")
+    let known = terminal_is("ghostty")
+        || terminal_is("kitty")
         || std::env::var_os("KITTY_WINDOW_ID").is_some();
     if known {
         KNOWN_STORAGE
     } else {
         DEFAULT_STORAGE
     }
+}
+
+/// Whether the terminal says it is `name`, such as "ghostty".
+fn terminal_is(name: &str) -> bool {
+    let var = |key| std::env::var(key).unwrap_or_default();
+    var("TERM_PROGRAM") == name || var("TERM").strip_prefix("xterm-") == Some(name)
+}
+
+/// Whether the terminal passes images on to a display that may be on another
+/// machine. Rex's server reads a temporary file where qpic runs, then sends
+/// its app the pixels uncompressed: 5.8 MB over the network for a 1440×900
+/// screenshot that takes 0.3 MB inline.
+fn relays_images() -> bool {
+    terminal_is("rex")
 }
 
 fn interrupts_upload(event: &Event) -> bool {
